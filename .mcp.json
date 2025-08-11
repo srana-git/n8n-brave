@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "n8n-mcp": {
+      "command": "npx",
+      "args": ["n8n-mcp"],
+      "env": {
+        "MCP_MODE": "stdio",
+        "LOG_LEVEL": "error",
+        "DISABLE_CONSOLE_OUTPUT": "true",
+        "N8N_API_URL": "https://process.bravemedia.io",
+        "N8N_API_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJjOTkyNTRlMC03ODc5LTRhYjItYWU4ZC05ZDdiOGNiNDVkNzQiLCJpc3MiOiJuOG4iLCJhdWQiOiJwdWJsaWMtYXBpIiwiaWF0IjoxNzU0OTM3MTYyfQ.O0OY6-OaVnjOEsY4glV5qDfZ5Lnmvx5sWc1-GQRg7gY"
+      }
+    }
+  }
+}
