@@ -1,0 +1,598 @@
+{
+  "name": "AI Collections - Cold Outreach V2",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "collections/cold-outreach",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "responseData": "allEntries",
+        "options": {}
+      },
+      "id": "webhook_trigger",
+      "name": "GHL New Collections Account",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  c.id as customer_id,\n  c.name,\n  c.email,\n  c.phone,\n  COUNT(DISTINCT l.id) as total_loans,\n  SUM(l.original_amount) as total_borrowed,\n  SUM(p.amount) as total_paid,\n  AVG(DATEDIFF(p.payment_date, l.due_date)) as avg_days_late,\n  DAY(MAX(p.payment_date)) as favorite_payment_day,\n  DAYNAME(MAX(p.payment_date)) as favorite_weekday,\n  COUNT(CASE WHEN p.type = 'partial' THEN 1 END) as partial_payments,\n  (SELECT balance FROM current_loans WHERE customer_id = c.id LIMIT 1) as current_balance,\n  (SELECT days_overdue FROM current_loans WHERE customer_id = c.id LIMIT 1) as days_past_due,\n  c.communication_preference as channel_preference\nFROM customers c\nLEFT JOIN loans l ON c.id = l.customer_id\nLEFT JOIN payments p ON l.id = p.loan_id\nWHERE c.id = '{{$json[\"customer_id\"]}}'\nGROUP BY c.id",
+        "options": {
+          "queryTimeout": 30000
+        }
+      },
+      "id": "mysql_query",
+      "name": "Query Loan History",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [450, 300],
+      "credentials": {
+        "mySql": {
+          "id": "mysql_readonly",
+          "name": "MySQL Read-Only"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Calculate settlement authority based on loan history\nconst balance = $input.item.json.current_balance || 0;\nconst daysPastDue = $input.item.json.days_past_due || 0;\nconst totalLoans = $input.item.json.total_loans || 0;\nconst avgDaysLate = $input.item.json.avg_days_late || 0;\nconst channelPref = $input.item.json.channel_preference || 'email';\n\nlet baseDiscount = 0.10; // Start at 10%\n\n// Time-based escalation\nif (daysPastDue > 30) baseDiscount += 0.05;\nif (daysPastDue > 60) baseDiscount += 0.10;\nif (daysPastDue > 90) baseDiscount += 0.10;\n\n// History-based adjustment\nif (avgDaysLate > 30) baseDiscount += 0.05;\nif (totalLoans > 5) baseDiscount -= 0.05; // Loyalty discount reduction\n\n// Cap at 40% maximum discount\nconst maxDiscount = Math.min(baseDiscount, 0.40);\n\n// Determine personality profile\nlet personality = 'standard';\nif (avgDaysLate > 0 && avgDaysLate <= 10) personality = 'reliable_but_slow';\nelse if ($input.item.json.favorite_payment_day === 15 || $input.item.json.favorite_payment_day === 30) personality = 'payday_payer';\nelse if ($input.item.json.partial_payments > 2) personality = 'partial_payer';\nelse if (avgDaysLate > 60) personality = 'chronic_late';\nelse if (totalLoans === 0) personality = 'ghost';\n\n// Determine communication channel\nlet selectedChannel = 'email'; // Default\nif (channelPref && channelPref.toLowerCase().includes('sms')) {\n  selectedChannel = 'sms';\n} else if (channelPref && channelPref.toLowerCase().includes('both')) {\n  selectedChannel = 'both';\n}\n\n// Return in correct format for n8n Code nodes\nreturn [{\n  json: {\n    ...$input.item.json,\n    settlement_authority: {\n      max_discount: maxDiscount,\n      min_acceptable: balance * (1 - maxDiscount),\n      immediate_settlement: balance * (1 - maxDiscount - 0.05),\n      payment_plan_months: daysPastDue > 60 ? 6 : 3\n    },\n    personality_profile: personality,\n    communication_channel: selectedChannel,\n    follow_up_count: 0 // First outreach\n  }\n}];"
+      },
+      "id": "calculate_authority",
+      "name": "Calculate Settlement Authority",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "customer:{{$json[\"customer_id\"]}}:profile",
+        "value": "={{JSON.stringify($json)}}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 604800,
+        "database": 0,
+        "options": {}
+      },
+      "id": "redis_cache_profile",
+      "name": "Cache Customer Profile",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "redis": {
+          "id": "redis_cache",
+          "name": "Redis Cache"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "chat",
+        "model": "gpt-4-turbo-preview",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are Jordan, an expert collections strategist. Create personalized outreach messages for both EMAIL and SMS formats.\n\nOUTPUT REQUIREMENTS:\nYou MUST return a JSON object with ALL of these fields:\n{\n  \"subject\": \"Email subject line\",\n  \"email_body\": \"Full HTML-formatted email body\",\n  \"sms_body\": \"SMS message under 160 characters\",\n  \"updated_summary\": \"Summary of this outreach for records\"\n}\n\nEMAIL GUIDELINES:\n- Use HTML tags for formatting (<p>, <br>, <b>)\n- Include greeting with customer name\n- Reference specific details from their history\n- Keep professional but empathetic tone\n- Do NOT include signature or closing (added automatically)\n- Do NOT include payment links (added automatically)\n\nSMS GUIDELINES:\n- Maximum 160 characters\n- Direct and urgent\n- Include key amount if follow-ups > 6\n- No links (added separately)\n\nCustomer Profile:\n- Name: {{$json[\"name\"]}}\n- Personality: {{$json[\"personality_profile\"]}}\n- Total Loans: {{$json[\"total_loans\"]}}\n- Days Past Due: {{$json[\"days_past_due\"]}}\n- Current Balance: ${{$json[\"current_balance\"]}}\n- Favorite Payment Day: {{$json[\"favorite_payment_day\"]}}\n- Follow-up Count: {{$json[\"follow_up_count\"]}}\n- Channel Selected: {{$json[\"communication_channel\"]}}\n\nESCALATION STRATEGY:\n- First contact (0): Friendly, helpful, work together\n- Early stage (1-4): Gentle reminders, importance of responding\n- Mid stage (5-9): Increase urgency, mention review risks\n- Late stage (10-14): Firm pressure, credit reporting warnings\n- Final stage (15+): Last notice before external collections\n\nREMEMBER:\n- Both email_body and sms_body are REQUIRED\n- Use HTML in email_body\n- Keep sms_body under 160 characters\n- Adjust tone based on follow_up_count"
+            },
+            {
+              "role": "user",
+              "content": "Generate personalized collection messages for customer {{$json[\"name\"]}} with balance ${{$json[\"current_balance\"]}} that is {{$json[\"days_past_due\"]}} days overdue. This is follow-up #{{$json[\"follow_up_count\"]}}. Communication channel preference: {{$json[\"communication_channel\"]}}."
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.7,
+          "maxTokens": 500,
+          "topP": 0.9,
+          "responseFormat": {
+            "type": "json_object"
+          }
+        }
+      },
+      "id": "openai_agent1",
+      "name": "AI Agent - Outreach Generator",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.1,
+      "position": [1050, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai_api",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Parse OpenAI response and prepare messages\nconst aiResponse = JSON.parse($input.item.json.message.content);\nconst channel = $input.item.json.communication_channel;\nconst customerId = $input.item.json.customer_id;\n\n// Payment links\nconst paymentLink = `https://pay.example.com/${customerId}`;\nconst arrangementLink = `https://arrange.example.com/${customerId}`;\n\n// Email signature\nconst emailSignature = `<p><b>Here are a few paths forward:</b></p>\n<p>✅ <b>Make a Payment Today</b><br>\nIf you're ready to tackle your balance now, you can make a payment securely here: <a href=\"${paymentLink}\">[Click Here]</a>.</p>\n<p>✅ <b>Set Up a Payment Arrangement</b><br>\nIf a full payment isn't possible right now, no worries. You can arrange a flexible payment plan that works for your budget: <a href=\"${arrangementLink}\">[Click Here]</a>.</p>\n<p>✅ <b>Smart Repayment Loan Program</b><br>\nLooking for a fresh start? You may qualify for our new program!</p>\n<p>A prompt response will give us a chance to help you effectively. Please give me a reply as soon as you can to talk about the best solution together!<br>\n<b>Jordan A.<br>Collections Department</b></p>`;\n\n// Prepare final email with signature\nconst finalEmailBody = aiResponse.email_body + emailSignature;\n\n// Add payment link to SMS if needed\nconst finalSmsBody = aiResponse.sms_body + ` Reply or visit: ${paymentLink}`;\n\n// Determine what to send\nlet sendEmail = false;\nlet sendSms = false;\n\nif (channel === 'both') {\n  sendEmail = true;\n  sendSms = true;\n} else if (channel === 'sms') {\n  sendSms = true;\n} else {\n  sendEmail = true; // Default to email\n}\n\n// Return in correct format\nreturn [{\n  json: {\n    customer_id: $input.item.json.customer_id,\n    customer_name: $input.item.json.name,\n    phone: $input.item.json.phone,\n    email: $input.item.json.email,\n    subject: aiResponse.subject,\n    email_body: finalEmailBody,\n    sms_body: finalSmsBody,\n    updated_summary: aiResponse.updated_summary,\n    send_email: sendEmail,\n    send_sms: sendSms,\n    current_balance: $input.item.json.current_balance,\n    settlement_authority: $input.item.json.settlement_authority,\n    personality_profile: $input.item.json.personality_profile,\n    communication_channel: channel\n  }\n}];"
+      },
+      "id": "prepare_messages",
+      "name": "Prepare Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json[\"send_email\"]}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "check_email",
+      "name": "Send Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1450, 250]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json[\"send_sms\"]}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "check_sms",
+      "name": "Send SMS?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1450, 450]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/conversations/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$credentials.apiKey}}"
+            },
+            {
+              "name": "Version",
+              "value": "2021-04-15"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "type",
+              "value": "Email"
+            },
+            {
+              "name": "contactId",
+              "value": "={{$json[\"customer_id\"]}}"
+            },
+            {
+              "name": "html",
+              "value": "={{$json[\"email_body\"]}}"
+            },
+            {
+              "name": "emailFrom",
+              "value": "Jordan@collections.example.com"
+            },
+            {
+              "name": "subject",
+              "value": "={{$json[\"subject\"]}}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000,
+          "retry": {
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "id": "send_email",
+      "name": "Send Email via GHL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1650, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl_api",
+          "name": "GoHighLevel API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/conversations/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$credentials.apiKey}}"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"type\": \"SMS\",\n  \"contactId\": \"{{$json[\"customer_id\"]}}\",\n  \"message\": \"{{$json[\"sms_body\"]}}\"\n}",
+        "options": {
+          "timeout": 10000,
+          "retry": {
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "id": "send_sms",
+      "name": "Send SMS via GHL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1650, 500],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl_api",
+          "name": "GoHighLevel API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Prepare conversation state for Redis\nconst messages = [];\n\n// Add email if sent\nif ($node[\"check_email\"].json.send_email) {\n  messages.push({\n    type: 'outbound',\n    channel: 'email',\n    subject: $node[\"prepare_messages\"].json.subject,\n    text: $node[\"prepare_messages\"].json.email_body,\n    timestamp: new Date().toISOString()\n  });\n}\n\n// Add SMS if sent\nif ($node[\"check_sms\"].json.send_sms) {\n  messages.push({\n    type: 'outbound',\n    channel: 'sms',\n    text: $node[\"prepare_messages\"].json.sms_body,\n    timestamp: new Date().toISOString()\n  });\n}\n\nconst conversation = {\n  status: 'outreach_sent',\n  messages: messages,\n  offers_made: [],\n  communication_channel: $node[\"prepare_messages\"].json.communication_channel,\n  last_contact: new Date().toISOString()\n};\n\n// Return in correct format\nreturn [{\n  json: {\n    customer_id: $node[\"prepare_messages\"].json.customer_id,\n    conversation: conversation,\n    summary: $node[\"prepare_messages\"].json.updated_summary\n  }\n}];"
+      },
+      "id": "prepare_conversation",
+      "name": "Prepare Conversation State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1850, 350]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "customer:{{$json[\"customer_id\"]}}:conversation",
+        "value": "={{JSON.stringify($json[\"conversation\"])}}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 604800,
+        "database": 0,
+        "options": {}
+      },
+      "id": "redis_cache_conversation",
+      "name": "Cache Conversation State",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2050, 350],
+      "credentials": {
+        "redis": {
+          "id": "redis_cache",
+          "name": "Redis Cache"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/contacts/{{$node[\"prepare_messages\"].json[\"customer_id\"]}}/notes",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$credentials.apiKey}}"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "body",
+              "value": "={{$json[\"summary\"]}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "save_note",
+      "name": "Save Note to GHL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [2250, 350],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl_api",
+          "name": "GoHighLevel API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "https://services.leadconnectorhq.com/contacts/{{$node[\"prepare_messages\"].json[\"customer_id\"]}}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$credentials.apiKey}}"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"customFields\": [\n    {\n      \"id\": \"ai_summary_id\",\n      \"value\": \"{{$json[\"note\"][\"id\"]}}\"\n    },\n    {\n      \"id\": \"0YiBsNriQMSUhwuA369g\",\n      \"value\": 1\n    },\n    {\n      \"id\": \"9E4f4wCB4gtCXy6cMZWJ\",\n      \"value\": \"{{$now.toFormat('LLL dd, yyyy')}}\"\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "update_contact",
+      "name": "Update Contact Fields",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [2450, 350],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl_api",
+          "name": "GoHighLevel API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#collections-activity",
+        "text": "🚀 New Cold Outreach Sent\n👤 Customer: {{$node[\"prepare_messages\"].json[\"customer_name\"]}} (#{{$node[\"prepare_messages\"].json[\"customer_id\"]}})\n💰 Balance: ${{$node[\"prepare_messages\"].json[\"current_balance\"]}}\n📧 Channel: {{$node[\"prepare_messages\"].json[\"communication_channel\"]}}\n{{$node[\"prepare_messages\"].json[\"send_email\"] ? \"📨 Email: \" + $node[\"prepare_messages\"].json[\"subject\"] : \"\"}}\n{{$node[\"prepare_messages\"].json[\"send_sms\"] ? \"💬 SMS Sent\" : \"\"}}",
+        "otherOptions": {}
+      },
+      "id": "slack_notification",
+      "name": "Slack Activity Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [2650, 350],
+      "credentials": {
+        "slackApi": {
+          "id": "slack_bot",
+          "name": "Slack Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "webhook_trigger": {
+      "main": [
+        [
+          {
+            "node": "mysql_query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "mysql_query": {
+      "main": [
+        [
+          {
+            "node": "calculate_authority",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "calculate_authority": {
+      "main": [
+        [
+          {
+            "node": "redis_cache_profile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "redis_cache_profile": {
+      "main": [
+        [
+          {
+            "node": "openai_agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "openai_agent1": {
+      "main": [
+        [
+          {
+            "node": "prepare_messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "prepare_messages": {
+      "main": [
+        [
+          {
+            "node": "check_email",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "check_sms",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check_email": {
+      "main": [
+        [
+          {
+            "node": "send_email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "prepare_conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check_sms": {
+      "main": [
+        [
+          {
+            "node": "send_sms",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "prepare_conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_email": {
+      "main": [
+        [
+          {
+            "node": "prepare_conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_sms": {
+      "main": [
+        [
+          {
+            "node": "prepare_conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "prepare_conversation": {
+      "main": [
+        [
+          {
+            "node": "redis_cache_conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "redis_cache_conversation": {
+      "main": [
+        [
+          {
+            "node": "save_note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "save_note": {
+      "main": [
+        [
+          {
+            "node": "update_contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "update_contact": {
+      "main": [
+        [
+          {
+            "node": "slack_notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "errorWorkflow": "collections-error-handler"
+  },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "2.0.0",
+  "triggerCount": 0,
+  "tags": [
+    {
+      "name": "collections",
+      "createdAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "name": "ai-powered",
+      "createdAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "name": "cold-outreach",
+      "createdAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "name": "multi-channel",
+      "createdAt": "2024-01-01T00:00:00.000Z"
+    }
+  ]
+}

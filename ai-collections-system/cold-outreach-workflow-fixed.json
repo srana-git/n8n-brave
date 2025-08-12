@@ -1,0 +1,344 @@
+{
+  "name": "AI Collections - Cold Outreach",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "collections/cold-outreach",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "responseData": "allEntries",
+        "options": {}
+      },
+      "id": "webhook_trigger",
+      "name": "GHL New Collections Account",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  c.id as customer_id,\n  c.name,\n  c.email,\n  c.phone,\n  COUNT(DISTINCT l.id) as total_loans,\n  SUM(l.original_amount) as total_borrowed,\n  SUM(p.amount) as total_paid,\n  AVG(DATEDIFF(p.payment_date, l.due_date)) as avg_days_late,\n  DAY(MAX(p.payment_date)) as favorite_payment_day,\n  DAYNAME(MAX(p.payment_date)) as favorite_weekday,\n  COUNT(CASE WHEN p.type = 'partial' THEN 1 END) as partial_payments,\n  (SELECT balance FROM current_loans WHERE customer_id = c.id LIMIT 1) as current_balance,\n  (SELECT days_overdue FROM current_loans WHERE customer_id = c.id LIMIT 1) as days_past_due\nFROM customers c\nLEFT JOIN loans l ON c.id = l.customer_id\nLEFT JOIN payments p ON l.id = p.loan_id\nWHERE c.id = '{{$json[\"customer_id\"]}}'\nGROUP BY c.id",
+        "options": {
+          "queryTimeout": 30000
+        }
+      },
+      "id": "mysql_query",
+      "name": "Query Loan History",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [450, 300],
+      "credentials": {
+        "mySql": {
+          "id": "mysql_readonly",
+          "name": "MySQL Read-Only"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Calculate settlement authority based on loan history\nconst balance = $input.item.json.current_balance || 0;\nconst daysPastDue = $input.item.json.days_past_due || 0;\nconst totalLoans = $input.item.json.total_loans || 0;\nconst avgDaysLate = $input.item.json.avg_days_late || 0;\n\nlet baseDiscount = 0.10; // Start at 10%\n\n// Time-based escalation\nif (daysPastDue > 30) baseDiscount += 0.05;\nif (daysPastDue > 60) baseDiscount += 0.10;\nif (daysPastDue > 90) baseDiscount += 0.10;\n\n// History-based adjustment\nif (avgDaysLate > 30) baseDiscount += 0.05;\nif (totalLoans > 5) baseDiscount -= 0.05; // Loyalty discount reduction\n\n// Cap at 40% maximum discount\nconst maxDiscount = Math.min(baseDiscount, 0.40);\n\n// Determine personality profile\nlet personality = 'standard';\nif (avgDaysLate > 0 && avgDaysLate <= 10) personality = 'reliable_but_slow';\nelse if ($input.item.json.favorite_payment_day === 15 || $input.item.json.favorite_payment_day === 30) personality = 'payday_payer';\nelse if ($input.item.json.partial_payments > 2) personality = 'partial_payer';\nelse if (avgDaysLate > 60) personality = 'chronic_late';\nelse if (totalLoans === 0) personality = 'ghost';\n\n// Return in correct format for n8n Code nodes\nreturn [{\n  json: {\n    ...$input.item.json,\n    settlement_authority: {\n      max_discount: maxDiscount,\n      min_acceptable: balance * (1 - maxDiscount),\n      immediate_settlement: balance * (1 - maxDiscount - 0.05),\n      payment_plan_months: daysPastDue > 60 ? 6 : 3\n    },\n    personality_profile: personality\n  }\n}];"
+      },
+      "id": "calculate_authority",
+      "name": "Calculate Settlement Authority",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "customer:{{$json[\"customer_id\"]}}:profile",
+        "value": "={{JSON.stringify($json)}}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 604800,
+        "database": 0,
+        "options": {}
+      },
+      "id": "redis_cache_profile",
+      "name": "Cache Customer Profile",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "redis": {
+          "id": "redis_cache",
+          "name": "Redis Cache"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "chat",
+        "model": "gpt-4-turbo-preview",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert collections strategist. Create 3 distinct message variants for cold outreach based on the customer's loan history and personality profile.\n\nVariant A - History-Based: Reference their specific payment history patterns\nVariant B - Emotional/Relationship: Focus on the relationship and understanding\nVariant C - Settlement Offer: Lead with a specific discount offer\n\nCustomer Profile:\n- Personality: {{$json[\"personality_profile\"]}}\n- Total Loans: {{$json[\"total_loans\"]}}\n- Days Past Due: {{$json[\"days_past_due\"]}}\n- Current Balance: ${{$json[\"current_balance\"]}}\n- Favorite Payment Day: {{$json[\"favorite_payment_day\"]}}\n- Settlement Authority: {{$json[\"settlement_authority\"][\"min_acceptable\"]}}\n\nKeep messages under 160 characters for SMS. Be empathetic but clear about the debt. Include [PAYMENT_LINK] placeholder.\n\nReturn JSON with format:\n{\n  \"variant_a\": \"message text\",\n  \"variant_b\": \"message text\",\n  \"variant_c\": \"message text\"\n}"
+            },
+            {
+              "role": "user",
+              "content": "Generate 3 personalized collection messages for customer {{$json[\"name\"]}} with balance ${{$json[\"current_balance\"]}} that is {{$json[\"days_past_due\"]}} days overdue."
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.7,
+          "maxTokens": 500,
+          "topP": 0.9,
+          "responseFormat": {
+            "type": "json_object"
+          }
+        }
+      },
+      "id": "openai_agent1",
+      "name": "AI Agent #1 - Cold Outreach",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.1,
+      "position": [1050, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai_api",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Parse OpenAI response and select variant based on personality profile\nconst messages = JSON.parse($input.item.json.message.content);\nconst personality = $input.item.json.personality_profile;\n\n// Smart variant selection based on personality\nlet selectedVariant = 'variant_a';\nlet selectedMessage = messages.variant_a;\n\nif (personality === 'payday_payer') {\n  selectedVariant = 'variant_c'; // Settlement offers work best\n  selectedMessage = messages.variant_c;\n} else if (personality === 'chronic_late' || personality === 'hardship') {\n  selectedVariant = 'variant_b'; // Emotional approach\n  selectedMessage = messages.variant_b;\n} else if (personality === 'reliable_but_slow') {\n  selectedVariant = 'variant_a'; // History-based reminder\n  selectedMessage = messages.variant_a;\n} else {\n  // A/B/C test for unknown personalities\n  const variants = ['variant_a', 'variant_b', 'variant_c'];\n  selectedVariant = variants[Math.floor(Math.random() * 3)];\n  selectedMessage = messages[selectedVariant];\n}\n\n// Replace payment link placeholder\nconst paymentLink = `https://pay.example.com/${$input.item.json.customer_id}`;\nconst finalMessage = selectedMessage.replace('[PAYMENT_LINK]', paymentLink);\n\n// Return in correct format\nreturn [{\n  json: {\n    customer_id: $input.item.json.customer_id,\n    customer_name: $input.item.json.name,\n    phone: $input.item.json.phone,\n    message_variant: selectedVariant,\n    message_text: finalMessage,\n    all_variants: messages,\n    current_balance: $input.item.json.current_balance,\n    settlement_authority: $input.item.json.settlement_authority,\n    personality_profile: personality\n  }\n}];"
+      },
+      "id": "select_variant",
+      "name": "Select Message Variant",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/conversations/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$credentials.apiKey}}"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"type\": \"SMS\",\n  \"contactId\": \"{{$json[\"customer_id\"]}}\",\n  \"message\": \"{{$json[\"message_text\"]}}\"\n}",
+        "options": {
+          "timeout": 10000,
+          "retry": {
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "id": "send_message",
+      "name": "Send SMS via GHL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1450, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl_api",
+          "name": "GoHighLevel API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Track conversation in Redis\nconst conversation = {\n  status: 'outreach_sent',\n  messages: [\n    {\n      type: 'outbound',\n      text: $input.item.json.message_text,\n      variant: $input.item.json.message_variant,\n      timestamp: new Date().toISOString()\n    }\n  ],\n  offers_made: [],\n  strategy_used: $input.item.json.message_variant,\n  last_contact: new Date().toISOString()\n};\n\n// Return in correct format\nreturn [{\n  json: {\n    customer_id: $input.item.json.customer_id,\n    conversation: conversation\n  }\n}];"
+      },
+      "id": "prepare_conversation",
+      "name": "Prepare Conversation State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1650, 300]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "customer:{{$json[\"customer_id\"]}}:conversation",
+        "value": "={{JSON.stringify($json[\"conversation\"])}}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 604800,
+        "database": 0,
+        "options": {}
+      },
+      "id": "redis_cache_conversation",
+      "name": "Cache Conversation State",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1850, 300],
+      "credentials": {
+        "redis": {
+          "id": "redis_cache",
+          "name": "Redis Cache"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#collections-activity",
+        "text": "🚀 New Cold Outreach Sent\nCustomer: {{$node[\"select_variant\"].json[\"customer_name\"]}} (#{{$node[\"select_variant\"].json[\"customer_id\"]}})\nBalance: ${{$node[\"select_variant\"].json[\"current_balance\"]}}\nVariant: {{$node[\"select_variant\"].json[\"message_variant\"]}}\nMessage: \"{{$node[\"select_variant\"].json[\"message_text\"]}}\"",
+        "otherOptions": {}
+      },
+      "id": "slack_notification",
+      "name": "Slack Activity Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [2050, 300],
+      "credentials": {
+        "slackApi": {
+          "id": "slack_bot",
+          "name": "Slack Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "webhook_trigger": {
+      "main": [
+        [
+          {
+            "node": "mysql_query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "mysql_query": {
+      "main": [
+        [
+          {
+            "node": "calculate_authority",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "calculate_authority": {
+      "main": [
+        [
+          {
+            "node": "redis_cache_profile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "redis_cache_profile": {
+      "main": [
+        [
+          {
+            "node": "openai_agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "openai_agent1": {
+      "main": [
+        [
+          {
+            "node": "select_variant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "select_variant": {
+      "main": [
+        [
+          {
+            "node": "send_message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_message": {
+      "main": [
+        [
+          {
+            "node": "prepare_conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "prepare_conversation": {
+      "main": [
+        [
+          {
+            "node": "redis_cache_conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "redis_cache_conversation": {
+      "main": [
+        [
+          {
+            "node": "slack_notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "errorWorkflow": "collections-error-handler"
+  },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "1.0.1",
+  "triggerCount": 0,
+  "tags": [
+    {
+      "name": "collections",
+      "createdAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "name": "ai-powered",
+      "createdAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "name": "cold-outreach",
+      "createdAt": "2024-01-01T00:00:00.000Z"
+    }
+  ]
+}

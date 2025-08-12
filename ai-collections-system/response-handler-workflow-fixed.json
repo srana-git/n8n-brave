@@ -1,0 +1,614 @@
+{
+  "name": "AI Collections - Response Handler",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "collections/response",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "responseData": "allEntries",
+        "options": {}
+      },
+      "id": "webhook_response",
+      "name": "GHL Customer Response",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [250, 400]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "customer:{{$json[\"customer_id\"]}}:profile",
+        "keyType": "automatic",
+        "database": 0,
+        "options": {}
+      },
+      "id": "redis_get_profile",
+      "name": "Get Customer Profile",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [450, 400],
+      "credentials": {
+        "redis": {
+          "id": "redis_cache",
+          "name": "Redis Cache"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "customer:{{$json[\"customer_id\"]}}:conversation",
+        "keyType": "automatic",
+        "database": 0,
+        "options": {}
+      },
+      "id": "redis_get_conversation",
+      "name": "Get Conversation History",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [650, 400],
+      "credentials": {
+        "redis": {
+          "id": "redis_cache",
+          "name": "Redis Cache"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Combine profile and conversation data\nconst profile = JSON.parse($input.item.json.profile || '{}');\nconst conversation = JSON.parse($input.item.json.conversation || '{messages: []}');\nconst customerMessage = $node[\"webhook_response\"].json.message;\n\n// Return in correct format\nreturn [{\n  json: {\n    customer_id: $node[\"webhook_response\"].json.customer_id,\n    customer_name: profile.name,\n    phone: profile.phone,\n    customer_message: customerMessage,\n    current_balance: profile.current_balance,\n    days_past_due: profile.days_past_due,\n    settlement_authority: profile.settlement_authority,\n    personality_profile: profile.personality_profile,\n    conversation_history: conversation.messages || [],\n    offers_made: conversation.offers_made || [],\n    total_loans: profile.total_loans,\n    avg_days_late: profile.avg_days_late\n  }\n}];"
+      },
+      "id": "combine_data",
+      "name": "Combine Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 400]
+    },
+    {
+      "parameters": {
+        "resource": "chat",
+        "model": "gpt-4-turbo-preview",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert collections agent with full authority to negotiate and close deals. Analyze the customer's response and generate an appropriate reply.\n\nSETTLEMENT AUTHORITY:\n- Minimum Acceptable: ${{$json[\"settlement_authority\"][\"min_acceptable\"]}}\n- Immediate Settlement: ${{$json[\"settlement_authority\"][\"immediate_settlement\"]}}\n- Max Discount: {{$json[\"settlement_authority\"][\"max_discount\"]}}%\n- Payment Plan: Up to {{$json[\"settlement_authority\"][\"payment_plan_months\"]}} months\n\nCUSTOMER PROFILE:\n- Balance: ${{$json[\"current_balance\"]}}\n- Days Overdue: {{$json[\"days_past_due\"]}}\n- Personality: {{$json[\"personality_profile\"]}}\n- Total Loans: {{$json[\"total_loans\"]}}\n\nDETECT INTENT and respond accordingly:\n1. PAYMENT_COMMITMENT: Provide payment link and confirmation\n2. NEGOTIATION: Counter-offer within authority limits\n3. HARDSHIP: Offer payment plan options\n4. DISPUTE: Provide evidence and clarification\n5. HOSTILE: De-escalate and suggest formal channels\n6. CONFUSION: Clarify the debt and options\n\nPREVIOUS OFFERS: {{JSON.stringify($json[\"offers_made\"])}}\n\nRESPONSE RULES:\n- Keep under 160 characters for SMS\n- Be empathetic but firm\n- Only offer discounts within authority\n- Include [PAYMENT_LINK] when accepting payment\n- Mark ESCALATE_TO_HUMAN if: legal threats, bankruptcy, identity theft, extreme hostility\n\nReturn JSON:\n{\n  \"intent\": \"detected_intent\",\n  \"response_message\": \"your response\",\n  \"escalate_to_human\": false,\n  \"settlement_offered\": null or {\"amount\": X, \"discount_percent\": Y},\n  \"payment_plan_offered\": null or {\"months\": X, \"monthly_amount\": Y}\n}"
+            },
+            {
+              "role": "user",
+              "content": "Customer message: \"{{$json[\"customer_message\"]}}\"\n\nConversation history: {{JSON.stringify($json[\"conversation_history\"])}}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.7,
+          "maxTokens": 500,
+          "topP": 0.9,
+          "responseFormat": {
+            "type": "json_object"
+          }
+        }
+      },
+      "id": "openai_agent2",
+      "name": "AI Agent #2 - Response Handler",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.1,
+      "position": [1050, 400],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai_api",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Parse AI response and prepare for routing\nconst aiResponse = JSON.parse($input.item.json.message.content);\nconst paymentLink = `https://pay.example.com/${$input.item.json.customer_id}`;\nconst finalMessage = aiResponse.response_message.replace('[PAYMENT_LINK]', paymentLink);\n\n// Return in correct format\nreturn [{\n  json: {\n    customer_id: $input.item.json.customer_id,\n    customer_name: $input.item.json.customer_name,\n    phone: $input.item.json.phone,\n    customer_message: $input.item.json.customer_message,\n    ai_response: finalMessage,\n    intent: aiResponse.intent,\n    escalate_to_human: aiResponse.escalate_to_human,\n    settlement_offered: aiResponse.settlement_offered,\n    payment_plan_offered: aiResponse.payment_plan_offered,\n    current_balance: $input.item.json.current_balance,\n    conversation_history: $input.item.json.conversation_history,\n    offers_made: $input.item.json.offers_made\n  }\n}];"
+      },
+      "id": "parse_response",
+      "name": "Parse AI Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json[\"escalate_to_human\"]}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "check_escalation",
+      "name": "Need Human?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1450, 400]
+    },
+    {
+      "parameters": {
+        "amount": 90,
+        "unit": "seconds"
+      },
+      "id": "wait_response",
+      "name": "Natural Delay (90s)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [1650, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/conversations/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$credentials.apiKey}}"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"type\": \"SMS\",\n  \"contactId\": \"{{$json[\"customer_id\"]}}\",\n  \"message\": \"{{$json[\"ai_response\"]}}\"\n}",
+        "options": {
+          "timeout": 10000,
+          "retry": {
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "id": "send_response",
+      "name": "Send Response via GHL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1850, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl_api",
+          "name": "GoHighLevel API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Update conversation history with new messages\nconst existingConversation = $input.item.json.conversation_history || [];\nconst existingOffers = $input.item.json.offers_made || [];\n\n// Add customer message\nexistingConversation.push({\n  type: 'inbound',\n  text: $input.item.json.customer_message,\n  timestamp: new Date().toISOString()\n});\n\n// Add AI response\nexistingConversation.push({\n  type: 'outbound',\n  text: $input.item.json.ai_response,\n  intent: $input.item.json.intent,\n  timestamp: new Date().toISOString()\n});\n\n// Add any new offers\nif ($input.item.json.settlement_offered) {\n  existingOffers.push({\n    type: 'settlement',\n    ...$input.item.json.settlement_offered,\n    timestamp: new Date().toISOString()\n  });\n}\n\nif ($input.item.json.payment_plan_offered) {\n  existingOffers.push({\n    type: 'payment_plan',\n    ...$input.item.json.payment_plan_offered,\n    timestamp: new Date().toISOString()\n  });\n}\n\n// Keep only last 10 messages to avoid Redis size issues\nconst trimmedConversation = existingConversation.slice(-10);\n\n// Return in correct format\nreturn [{\n  json: {\n    customer_id: $input.item.json.customer_id,\n    conversation: {\n      status: $input.item.json.intent,\n      messages: trimmedConversation,\n      offers_made: existingOffers,\n      last_contact: new Date().toISOString(),\n      last_intent: $input.item.json.intent\n    }\n  }\n}];"
+      },
+      "id": "update_conversation",
+      "name": "Update Conversation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2050, 300]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "customer:{{$json[\"customer_id\"]}}:conversation",
+        "value": "={{JSON.stringify($json[\"conversation\"])}}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 604800,
+        "database": 0,
+        "options": {}
+      },
+      "id": "redis_update_conversation",
+      "name": "Save Conversation State",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2250, 300],
+      "credentials": {
+        "redis": {
+          "id": "redis_cache",
+          "name": "Redis Cache"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{$json[\"intent\"]}}",
+                    "rightValue": "PAYMENT_COMMITMENT",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "outputKey": "payment"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{$json[\"intent\"]}}",
+                    "rightValue": "NEGOTIATION",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "outputKey": "negotiation"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{$json[\"intent\"]}}",
+                    "rightValue": "HARDSHIP",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "outputKey": "hardship"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{$json[\"intent\"]}}",
+                    "rightValue": "DISPUTE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "outputKey": "dispute"
+            }
+          ]
+        },
+        "fallbackOutput": "extra"
+      },
+      "id": "intent_switch",
+      "name": "Route by Intent",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [2450, 300]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#collections-payments",
+        "text": "💰 Payment Commitment!\nCustomer: {{$json[\"customer_name\"]}} (#{{$json[\"customer_id\"]}})\nAmount: ${{$json[\"current_balance\"]}}\nMessage: \"{{$json[\"customer_message\"]}}\"\nOur Response: \"{{$json[\"ai_response\"]}}\"",
+        "otherOptions": {}
+      },
+      "id": "slack_payment",
+      "name": "Slack Payment Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [2650, 200],
+      "credentials": {
+        "slackApi": {
+          "id": "slack_bot",
+          "name": "Slack Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#collections-settlements",
+        "text": "🤝 Settlement Negotiation\nCustomer: {{$json[\"customer_name\"]}} (#{{$json[\"customer_id\"]}})\nOriginal: ${{$json[\"current_balance\"]}}\nOffered: ${{$json[\"settlement_offered\"][\"amount\"]}}\nDiscount: {{$json[\"settlement_offered\"][\"discount_percent\"]}}%\nCustomer: \"{{$json[\"customer_message\"]}}\"\nOur Response: \"{{$json[\"ai_response\"]}}\"",
+        "otherOptions": {}
+      },
+      "id": "slack_negotiation",
+      "name": "Slack Settlement Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [2650, 300],
+      "credentials": {
+        "slackApi": {
+          "id": "slack_bot",
+          "name": "Slack Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#collections-escalations",
+        "text": "⚠️ ESCALATION REQUIRED\nCustomer: {{$json[\"customer_name\"]}} (#{{$json[\"customer_id\"]}})\nBalance: ${{$json[\"current_balance\"]}}\nReason: {{$json[\"intent\"]}}\nCustomer Message: \"{{$json[\"customer_message\"]}}\"\nAI Response: \"{{$json[\"ai_response\"]}}\"\nStatus: Automation paused - Human intervention needed",
+        "otherOptions": {}
+      },
+      "id": "slack_escalation",
+      "name": "Slack Escalation Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [1650, 500],
+      "credentials": {
+        "slackApi": {
+          "id": "slack_bot",
+          "name": "Slack Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "https://services.leadconnectorhq.com/contacts/{{$json[\"customer_id\"]}}/tags",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$credentials.apiKey}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"tags\": [\"needs_human_review\", \"escalated\"]\n}",
+        "options": {}
+      },
+      "id": "tag_escalation",
+      "name": "Tag for Human Review",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1850, 500],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl_api",
+          "name": "GoHighLevel API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#collections-activity",
+        "text": "💬 Response Processed\nCustomer: {{$json[\"customer_name\"]}} (#{{$json[\"customer_id\"]}})\nIntent: {{$json[\"intent\"]}}\nCustomer: \"{{$json[\"customer_message\"]}}\"\nOur Response: \"{{$json[\"ai_response\"]}}\"",
+        "otherOptions": {}
+      },
+      "id": "slack_general",
+      "name": "Slack Activity Log",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [2650, 400],
+      "credentials": {
+        "slackApi": {
+          "id": "slack_bot",
+          "name": "Slack Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "webhook_response": {
+      "main": [
+        [
+          {
+            "node": "redis_get_profile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "redis_get_profile": {
+      "main": [
+        [
+          {
+            "node": "redis_get_conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "redis_get_conversation": {
+      "main": [
+        [
+          {
+            "node": "combine_data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "combine_data": {
+      "main": [
+        [
+          {
+            "node": "openai_agent2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "openai_agent2": {
+      "main": [
+        [
+          {
+            "node": "parse_response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "parse_response": {
+      "main": [
+        [
+          {
+            "node": "check_escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check_escalation": {
+      "main": [
+        [
+          {
+            "node": "wait_response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "slack_escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "wait_response": {
+      "main": [
+        [
+          {
+            "node": "send_response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send_response": {
+      "main": [
+        [
+          {
+            "node": "update_conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "update_conversation": {
+      "main": [
+        [
+          {
+            "node": "redis_update_conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "redis_update_conversation": {
+      "main": [
+        [
+          {
+            "node": "intent_switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "intent_switch": {
+      "main": [
+        [
+          {
+            "node": "slack_payment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "slack_negotiation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "slack_general",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "slack_general",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "slack_general",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "slack_escalation": {
+      "main": [
+        [
+          {
+            "node": "tag_escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "errorWorkflow": "collections-error-handler"
+  },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "1.0.1",
+  "triggerCount": 0,
+  "tags": [
+    {
+      "name": "collections",
+      "createdAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "name": "ai-powered",
+      "createdAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "name": "response-handler",
+      "createdAt": "2024-01-01T00:00:00.000Z"
+    }
+  ]
+}

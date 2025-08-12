@@ -1,0 +1,256 @@
+{
+  "name": "AI Collections - Daily Report",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "cronExpression": "0 17 * * *"
+        }
+      },
+      "id": "cron_trigger",
+      "name": "Daily at 5pm EST",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1.1,
+      "position": [250, 400]
+    },
+    {
+      "parameters": {
+        "operation": "keys",
+        "keyPattern": "customer:*:conversation",
+        "keyType": "automatic",
+        "database": 0,
+        "options": {}
+      },
+      "id": "redis_get_keys",
+      "name": "Get All Conversations",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [450, 400],
+      "credentials": {
+        "redis": {
+          "id": "redis_cache",
+          "name": "Redis Cache"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Process all conversations from today\nconst allKeys = $input.all();\nconst today = new Date();\ntoday.setHours(0, 0, 0, 0);\n\nlet metrics = {\n  messages_sent: 0,\n  responses_received: 0,\n  unique_conversations: 0,\n  settlements_approved: 0,\n  payment_commitments: 0,\n  payment_plans_created: 0,\n  escalations: 0,\n  total_offered: 0,\n  total_committed: 0,\n  variant_a_count: 0,\n  variant_b_count: 0,\n  variant_c_count: 0,\n  variant_a_responses: 0,\n  variant_b_responses: 0,\n  variant_c_responses: 0,\n  intents: {\n    PAYMENT_COMMITMENT: 0,\n    NEGOTIATION: 0,\n    HARDSHIP: 0,\n    DISPUTE: 0,\n    HOSTILE: 0,\n    CONFUSION: 0\n  }\n};\n\n// Process each conversation key\nfor (const item of allKeys) {\n  const key = item.json.key;\n  // Will need to fetch actual conversation data in next node\n  metrics.unique_conversations++;\n}\n\n// Return in correct format\nreturn [{\n  json: {\n    report_date: new Date().toISOString(),\n    conversation_keys: allKeys.map(k => k.json.key),\n    initial_metrics: metrics\n  }\n}];"
+      },
+      "id": "process_metrics",
+      "name": "Calculate Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 400]
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "id": "split_batch",
+      "name": "Process in Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [850, 400]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "={{$json[\"key\"]}}",
+        "keyType": "automatic",
+        "database": 0,
+        "options": {}
+      },
+      "id": "redis_get_conversation",
+      "name": "Get Conversation Data",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1050, 400],
+      "credentials": {
+        "redis": {
+          "id": "redis_cache",
+          "name": "Redis Cache"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Aggregate all conversation data\nconst conversations = $input.all();\nconst today = new Date();\ntoday.setHours(0, 0, 0, 0);\n\nlet metrics = {\n  messages_sent: 0,\n  responses_received: 0,\n  unique_conversations: conversations.length,\n  settlements_approved: 0,\n  payment_commitments: 0,\n  payment_plans_created: 0,\n  escalations: 0,\n  total_offered: 0,\n  total_committed: 0,\n  variant_performance: {\n    variant_a: { sent: 0, responded: 0 },\n    variant_b: { sent: 0, responded: 0 },\n    variant_c: { sent: 0, responded: 0 }\n  },\n  intents: {\n    PAYMENT_COMMITMENT: 0,\n    NEGOTIATION: 0,\n    HARDSHIP: 0,\n    DISPUTE: 0,\n    HOSTILE: 0,\n    CONFUSION: 0\n  },\n  hourly_activity: Array(24).fill(0)\n};\n\n// Process each conversation\nfor (const conv of conversations) {\n  try {\n    const data = JSON.parse(conv.json.value || '{}');\n    \n    // Count messages from today\n    if (data.messages) {\n      for (const msg of data.messages) {\n        const msgDate = new Date(msg.timestamp);\n        if (msgDate >= today) {\n          if (msg.type === 'outbound') {\n            metrics.messages_sent++;\n            \n            // Track variant performance\n            if (msg.variant) {\n              metrics.variant_performance[msg.variant].sent++;\n            }\n          } else if (msg.type === 'inbound') {\n            metrics.responses_received++;\n            \n            // Track which variant got response\n            const prevOutbound = data.messages\n              .filter(m => m.type === 'outbound' && m.variant)\n              .pop();\n            if (prevOutbound && prevOutbound.variant) {\n              metrics.variant_performance[prevOutbound.variant].responded++;\n            }\n          }\n          \n          // Track hourly activity\n          const hour = msgDate.getHours();\n          metrics.hourly_activity[hour]++;\n          \n          // Track intents\n          if (msg.intent && metrics.intents[msg.intent] !== undefined) {\n            metrics.intents[msg.intent]++;\n            \n            if (msg.intent === 'PAYMENT_COMMITMENT') {\n              metrics.payment_commitments++;\n            } else if (msg.intent === 'HOSTILE') {\n              metrics.escalations++;\n            }\n          }\n        }\n      }\n    }\n    \n    // Count offers from today\n    if (data.offers_made) {\n      for (const offer of data.offers_made) {\n        const offerDate = new Date(offer.timestamp);\n        if (offerDate >= today) {\n          if (offer.type === 'settlement') {\n            metrics.settlements_approved++;\n            metrics.total_offered += (offer.amount || 0);\n          } else if (offer.type === 'payment_plan') {\n            metrics.payment_plans_created++;\n          }\n        }\n      }\n    }\n  } catch (e) {\n    // Skip invalid data\n  }\n}\n\n// Calculate response rates\nconst overallResponseRate = metrics.messages_sent > 0 \n  ? ((metrics.responses_received / metrics.messages_sent) * 100).toFixed(1)\n  : 0;\n\nconst variantResponseRates = {};\nfor (const [variant, data] of Object.entries(metrics.variant_performance)) {\n  variantResponseRates[variant] = data.sent > 0\n    ? ((data.responded / data.sent) * 100).toFixed(1)\n    : 0;\n}\n\n// Calculate automation rate\nconst totalInteractions = metrics.responses_received;\nconst automationRate = totalInteractions > 0\n  ? (((totalInteractions - metrics.escalations) / totalInteractions) * 100).toFixed(1)\n  : 100;\n\n// Find best performing variant\nlet bestVariant = 'none';\nlet bestRate = 0;\nfor (const [variant, rate] of Object.entries(variantResponseRates)) {\n  if (parseFloat(rate) > bestRate) {\n    bestRate = parseFloat(rate);\n    bestVariant = variant;\n  }\n}\n\n// Find peak activity hour\nlet peakHour = 0;\nlet peakActivity = 0;\nfor (let i = 0; i < 24; i++) {\n  if (metrics.hourly_activity[i] > peakActivity) {\n    peakActivity = metrics.hourly_activity[i];\n    peakHour = i;\n  }\n}\n\n// Return in correct format\nreturn [{\n  json: {\n    report_date: new Date().toISOString().split('T')[0],\n    metrics: metrics,\n    calculated: {\n      response_rate: overallResponseRate + '%',\n      variant_response_rates: variantResponseRates,\n      best_variant: bestVariant,\n      automation_rate: automationRate + '%',\n      peak_hour: peakHour + ':00',\n      average_settlement_offer: metrics.settlements_approved > 0\n        ? (metrics.total_offered / metrics.settlements_approved).toFixed(2)\n        : 0\n    }\n  }\n}];"
+      },
+      "id": "aggregate_data",
+      "name": "Aggregate Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 400]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Format the report for Slack\nconst metrics = $input.item.json.metrics;\nconst calc = $input.item.json.calculated;\nconst date = $input.item.json.report_date;\n\nconst report = `📊 *DAILY COLLECTIONS REPORT* - ${date}\n═══════════════════════════════════════════════\n\n*ACTIVITY METRICS*\n├─ Messages Sent: ${metrics.messages_sent}\n├─ Responses Received: ${metrics.responses_received} (${calc.response_rate} response rate)\n└─ Unique Conversations: ${metrics.unique_conversations}\n\n*FINANCIAL RESULTS*\n├─ Settlements Approved: ${metrics.settlements_approved}\n├─ Payment Plans Created: ${metrics.payment_plans_created}\n├─ Payment Commitments: ${metrics.payment_commitments}\n└─ Average Settlement: $${calc.average_settlement_offer}\n\n*AUTOMATION METRICS*\n├─ Handled Autonomously: ${calc.automation_rate}\n├─ Human Escalations: ${metrics.escalations}\n└─ Peak Activity Hour: ${calc.peak_hour}\n\n*MESSAGE VARIANT PERFORMANCE*\n├─ Variant A: ${metrics.variant_performance.variant_a.sent} sent, ${calc.variant_response_rates.variant_a}% response\n├─ Variant B: ${metrics.variant_performance.variant_b.sent} sent, ${calc.variant_response_rates.variant_b}% response\n├─ Variant C: ${metrics.variant_performance.variant_c.sent} sent, ${calc.variant_response_rates.variant_c}% response\n└─ Best Performer: ${calc.best_variant.toUpperCase()}\n\n*INTENT BREAKDOWN*\n├─ Payment Commitments: ${metrics.intents.PAYMENT_COMMITMENT}\n├─ Negotiations: ${metrics.intents.NEGOTIATION}\n├─ Hardship Cases: ${metrics.intents.HARDSHIP}\n├─ Disputes: ${metrics.intents.DISPUTE}\n├─ Hostile: ${metrics.intents.HOSTILE}\n└─ Confusion: ${metrics.intents.CONFUSION}\n\n═══════════════════════════════════════════════\n_Generated at ${new Date().toLocaleTimeString('en-US', {timeZone: 'America/New_York'})}_`;\n\n// Return in correct format\nreturn [{\n  json: {\n    report_text: report,\n    metrics: metrics,\n    calculated: calc,\n    report_date: date\n  }\n}];"
+      },
+      "id": "format_report",
+      "name": "Format Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1450, 400]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#collections-reports",
+        "text": "={{$json[\"report_text\"]}}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "id": "slack_report",
+      "name": "Send Daily Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [1650, 400],
+      "credentials": {
+        "slackApi": {
+          "id": "slack_bot",
+          "name": "Slack Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO collections_reports (report_date, messages_sent, responses_received, response_rate, settlements_approved, payment_commitments, escalations, automation_rate, best_variant, created_at) VALUES ('{{$json[\"report_date\"]}}', {{$json[\"metrics\"][\"messages_sent\"]}}, {{$json[\"metrics\"][\"responses_received\"]}}, '{{$json[\"calculated\"][\"response_rate\"]}}', {{$json[\"metrics\"][\"settlements_approved\"]}}, {{$json[\"metrics\"][\"payment_commitments\"]}}, {{$json[\"metrics\"][\"escalations\"]}}, '{{$json[\"calculated\"][\"automation_rate\"]}}', '{{$json[\"calculated\"][\"best_variant\"]}}', NOW())",
+        "options": {}
+      },
+      "id": "mysql_save",
+      "name": "Save Report to Database",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [1850, 400],
+      "credentials": {
+        "mySql": {
+          "id": "mysql_write",
+          "name": "MySQL Write"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "cron_trigger": {
+      "main": [
+        [
+          {
+            "node": "redis_get_keys",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "redis_get_keys": {
+      "main": [
+        [
+          {
+            "node": "process_metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "process_metrics": {
+      "main": [
+        [
+          {
+            "node": "split_batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "split_batch": {
+      "main": [
+        [
+          {
+            "node": "redis_get_conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "redis_get_conversation": {
+      "main": [
+        [
+          {
+            "node": "aggregate_data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "aggregate_data": {
+      "main": [
+        [
+          {
+            "node": "format_report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "format_report": {
+      "main": [
+        [
+          {
+            "node": "slack_report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "slack_report": {
+      "main": [
+        [
+          {
+            "node": "mysql_save",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/New_York",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true"
+  },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "1.0.1",
+  "triggerCount": 0,
+  "tags": [
+    {
+      "name": "collections",
+      "createdAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "name": "reporting",
+      "createdAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "name": "scheduled",
+      "createdAt": "2024-01-01T00:00:00.000Z"
+    }
+  ]
+}
